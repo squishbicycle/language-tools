@@ -11,6 +11,18 @@ Small, offline-first command-line tools and menu-bar apps for learning **Japanes
 
 All four are plain Python 3 scripts that use only the standard library. The two pop-up apps are small SwiftUI programs.
 
+### Quick start
+
+```sh
+git clone https://github.com/squishbicycle/language-tools.git ~/code/language-tools
+ln -s ~/code/language-tools/japanese ~/japanese-tools
+ln -s ~/code/language-tools/spanish ~/spanish-tools
+~/spanish-tools/sdict --update && ~/spanish-tools/sdict hay      # → haber: "there is, there are"
+~/japanese-tools/jdict --update && ~/japanese-tools/jdict 食べました   # → 食べる: "to eat"
+```
+
+Then build the hotkey apps and put the commands on your PATH: see [Install](#install). Japanese sentence audio can optionally use Google's voices: see [Setting up Google voices](#setting-up-google-voices-optional).
+
 ---
 
 ## jdict — Japanese dictionary
@@ -58,7 +70,7 @@ jsent -g Aoede ...      # a different Google voice
 jsent --mac ...         # skip straight to the macOS voice
 ```
 
-Google voices are optional. To use them, create an API key restricted to the Text-to-Speech API in Google Cloud and save it in a file named `google-tts-key` next to `jsent`. (That file is ignored by git, so it's never committed.) Setting a small billing budget is a good idea.
+Google voices are optional; without a key, jsent uses Tatoeba and the macOS voice. See [Setting up Google voices](#setting-up-google-voices-optional). `jsay` also uses Google as its fallback when a word has no native recording.
 
 ## sdict — Spanish dictionary
 
@@ -103,6 +115,35 @@ sdict --update
 ```
 
 Open each app once, then use its menu-bar icon to turn on **Open at Login** or pick a different hotkey.
+
+## Setting up Google voices (optional)
+
+`jsent` (and `jsay`'s fallback) can use Google Cloud Text-to-Speech's natural-sounding Chirp 3 HD voices. This needs a Google Cloud account with billing turned on. Google's [pricing page](https://cloud.google.com/text-to-speech/pricing) lists the current rates and the monthly free allowance; reading single sentences is usually tiny, and jsent caches every clip, so a sentence is only paid for once.
+
+1. **Create a project** at [console.cloud.google.com](https://console.cloud.google.com/) and link a billing account.
+2. **Enable the API:** *APIs & Services → Library →* search **Cloud Text-to-Speech API** → **Enable**.
+3. **Create a key:** *APIs & Services → Credentials → Create credentials → API key*.
+4. **Restrict the key** (important): edit it, and under *API restrictions* choose **Restrict key → Cloud Text-to-Speech API**. A leaked key then can't be used for anything else.
+5. **Save it** next to jsent, readable only by you:
+   ```sh
+   pbpaste > ~/japanese-tools/google-tts-key     # with the key copied to the clipboard
+   chmod 600 ~/japanese-tools/google-tts-key
+   ```
+   `google-tts-key` is listed in `.gitignore`, so it is never committed. Never paste the key into code, issues, or chat.
+6. **Set a budget:** *Billing → Budgets & alerts → Create budget* (for example $1) with email alerts.
+7. **Test it:** `jsent 私はアメリカ人です。` should play Google's voice, and `jsent --google-only ...` fails loudly if the key isn't working.
+
+### Optional: automatic billing kill switch
+
+A budget only sends alerts. [`japanese/stop-billing/`](japanese/stop-billing/) contains a small Cloud Function that **unlinks billing from the project** as soon as a budget notification reports spending over the limit, so a runaway bill can't happen. It needs the [gcloud CLI](https://cloud.google.com/sdk/docs/install):
+
+```sh
+gcloud auth login
+gcloud billing budgets list --billing-account=XXXXXX-XXXXXX-XXXXXX   # copy the budget's name
+~/japanese-tools/stop-billing/setup.sh YOUR_PROJECT_ID billingAccounts/XXXXXX-XXXXXX-XXXXXX/budgets/BUDGET_ID
+```
+
+Keep in mind that budget notifications can lag real spending by hours, so this caps costs rather than enforcing an exact limit. When it triggers, everything paid in that project stops until you relink billing: `gcloud billing projects link YOUR_PROJECT_ID --billing-account=XXXXXX-XXXXXX-XXXXXX`.
 
 ## Data and credits
 
