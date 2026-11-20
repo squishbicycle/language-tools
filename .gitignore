@@ -1,0 +1,14 @@
+# secrets
+google-tts-key
+*.key
+
+# downloaded data, caches, builds
+jdict-data/
+sdict-data/
+cache/
+build/
+*.sqlite
+*.part
+
+# macOS
+.DS_Store

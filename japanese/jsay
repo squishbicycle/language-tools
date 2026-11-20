@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""jsay: play a native-speaker recording of a Japanese word.
+
+Usage:
+  jsay          # word from the clipboard
+  jsay 学生      # word given as an argument
+
+Audio comes from JapanesePod101, the default source in Yomitan. When it has no
+recording, jsay uses Google's voice via `jsent --google-only` (never the macOS
+voice).
+"""
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+
+AUDIO_URL = "https://assets.languagepod101.com/dictionary/japanese/audiomp3.php"
+JISHO_URL = "https://jisho.org/api/v1/search/words"
+# JapanesePod101 returns this clip ("the audio for this clip is currently not
+# available") instead of an error when it has no recording.
+NOT_FOUND_SHA256 = "ae6398b5a27bc8c0a771df6c907ade794be15518174773c58c7c7ddd17098906"
+STRIP = " \t\r\n　。、！？!?.,「」『』()（）"
+
+
+def fetch(url, params):
+    full = url + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(full, headers={"User-Agent": "jsay"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.read()
+
+
+def to_hiragana(s):
+    return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in s)
+
+
+def meaning_of(entry):
+    senses = entry.get("senses") or [{}]
+    return "; ".join(senses[0].get("english_definitions", [])[:3])
+
+
+def candidates(text):
+    """(kanji, kana, meaning) triples to try, best guesses first."""
+    try:
+        data = json.loads(fetch(JISHO_URL, {"keyword": text}))["data"]
+    except Exception:
+        data = []
+    target = to_hiragana(text)
+    matches = []
+    for entry in data[:5]:
+        for form in entry.get("japanese", []):
+            word, reading = form.get("word"), form.get("reading")
+            if not reading:
+                continue
+            if text == word or target == to_hiragana(reading):
+                matches.append((word or reading, reading, meaning_of(entry)))
+
+    # Try the exact spelling first, labelled with the top dictionary sense.
+    triples = [(text, text, matches[0][2] if matches else "")]
+    seen = {(text, text)}
+    for kanji, kana, meaning in matches:
+        if (kanji, kana) not in seen:
+            seen.add((kanji, kana))
+            triples.append((kanji, kana, meaning))
+    return triples
+
+
+def main():
+    if len(sys.argv) > 1:
+        text = " ".join(sys.argv[1:])
+    else:
+        text = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    text = text.strip(STRIP)
+    if not text:
+        sys.exit("jsay: nothing to look up (clipboard is empty)")
+
+    for kanji, kana, meaning in candidates(text):
+        try:
+            audio = fetch(AUDIO_URL, {"kanji": kanji, "kana": kana})
+        except Exception as e:
+            sys.exit("jsay: could not reach JapanesePod101 ({})".format(e))
+        if hashlib.sha256(audio).hexdigest() == NOT_FOUND_SHA256:
+            continue
+        label = kana if kanji == kana else "{}【{}】".format(kanji, kana)
+        print("▶ " + label + (" — " + meaning if meaning else ""))
+        with tempfile.NamedTemporaryFile(suffix=".mp3") as f:
+            f.write(audio)
+            f.flush()
+            subprocess.run(["afplay", f.name])
+        return
+
+    print("jsay: no native recording for 「{}」; using Google's voice".format(text), file=sys.stderr)
+    jsent = os.path.join(os.path.dirname(os.path.realpath(__file__)), "jsent")
+    sys.exit(subprocess.run([jsent, "--google-only", text]).returncode)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""sdict: offline Spanish-English dictionary (English Wiktionary data via kaikki.org).
+
+  sdict hay            Spanish word, phrase, or conjugated form (accents optional)
+  sdict -e city        English -> Spanish
+  sdict --json hay     JSON for SDict.app
+  sdict --update       re-download the data and rebuild the database
+
+Python 3.9 stdlib only. Run with python3 -I.
+"""
+import difflib
+import gzip
+import json
+import os
+import re
+import sqlite3
+import sys
+import unicodedata
+import urllib.request
+
+HOME = os.path.expanduser("~")
+DATA = os.path.join(HOME, "spanish-tools", "sdict-data")
+DB = os.path.join(DATA, "sdict.sqlite")
+SRC = os.path.join(DATA, "download", "spanish.jsonl.gz")
+URL = "https://kaikki.org/dictionary/Spanish/kaikki.org-dictionary-Spanish.jsonl.gz"
+
+POS_ORDER = ["verb", "noun", "adj", "adv", "pron", "det", "article", "conj", "prep",
+             "contraction", "intj", "phrase", "prep_phrase", "proverb", "num", "particle"]
+POS_LABEL = {"adj": "adjective", "adv": "adverb", "pron": "pronoun", "det": "determiner",
+             "conj": "conjunction", "prep": "preposition", "intj": "interjection",
+             "prep_phrase": "prepositional phrase", "num": "number", "name": "proper noun"}
+SKIP_POS = {"character", "symbol", "punct", "interfix", "suffix", "prefix", "romanization"}
+SHOW_TAGS = {"colloquial", "slang", "vulgar", "informal", "formal", "Mexico", "Spain",
+             "Latin-America", "Argentina", "Caribbean", "Central-America", "rare", "dated",
+             "obsolete", "archaic", "derogatory", "figuratively", "transitive",
+             "intransitive", "reflexive", "pronominal", "impersonal", "auxiliary",
+             "uncountable", "with-voseo"}
+OLD_TAGS = {"obsolete", "archaic", "rare", "dated"}
+MAX_SENSES = 8
+MAX_ENTRIES = 8
+
+
+def norm(s):
+    s = unicodedata.normalize("NFD", s.lower())
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+def clean_query(q):
+    return re.sub(r"[¿?¡!.,;:\"“”«»()]", " ", q).strip().strip("'").strip()
+
+
+# ---------------------------------------------------------------- build
+
+def pick_ipa(sounds):
+    # Prefer Latin American pronunciation (seseo, yeísmo): no θ or ʎ.
+    ipas = [s["ipa"] for s in sounds if s.get("ipa")]
+    phonemic = [i for i in ipas if i.startswith("/")] or ipas
+    for i in phonemic:
+        if "θ" not in i and "ʎ" not in i:
+            return i
+    return phonemic[0] if phonemic else None
+
+
+def build(src=SRC):
+    tmp = DB + ".tmp"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    con = sqlite3.connect(tmp)
+    con.executescript("""
+        CREATE TABLE entries (id INTEGER PRIMARY KEY, word TEXT, lower TEXT, norm TEXT,
+                              pos TEXT, ipa TEXT, syll TEXT, gender TEXT, is_form INTEGER,
+                              senses TEXT);
+        CREATE VIRTUAL TABLE eng USING fts5(gloss, entry UNINDEXED, tokenize='porter unicode61');
+    """)
+    rows, eng = [], []
+    n = 0
+    with gzip.open(src, "rt", encoding="utf-8") as f:
+        for line in f:
+            d = json.loads(line)
+            pos, word = d.get("pos"), d.get("word")
+            if not word or pos in SKIP_POS:
+                continue
+            senses, forms_only, gender = [], True, None
+            for s in d.get("senses", []):
+                glosses = s.get("glosses")
+                if not glosses:
+                    continue
+                tags = s.get("tags", [])
+                form_of = [x["word"] for x in s.get("form_of", []) if x.get("word")]
+                if not form_of:
+                    form_of = [x["word"] for x in s.get("alt_of", []) if x.get("word")]
+                if "form-of" not in tags and "alt-of" not in tags:
+                    forms_only = False
+                if gender is None:
+                    gender = "f" if "feminine" in tags else "m" if "masculine" in tags else None
+                    if "masculine" in tags and "feminine" in tags:
+                        gender = "m/f"
+                sense = {"g": glosses[-1], "t": [t for t in tags if t in SHOW_TAGS]}
+                if form_of:
+                    sense["f"] = form_of
+                for e in s.get("examples", []):
+                    if e.get("text") and (e.get("english") or e.get("translation")) and len(e["text"]) < 120:
+                        sense["x"] = [e["text"], e.get("english") or e.get("translation")]
+                        break
+                senses.append(sense)
+            if not senses:
+                continue
+            n += 1
+            syll = None
+            for h in d.get("hyphenations", []):
+                if h.get("parts"):
+                    syll = "·".join(h["parts"])
+                    break
+            rows.append((n, word, word.lower(), norm(word), pos, pick_ipa(d.get("sounds", [])),
+                         syll, gender if pos == "noun" else None, int(forms_only),
+                         json.dumps(senses, ensure_ascii=False)))
+            if not forms_only:
+                for s in senses:
+                    if "f" not in s:
+                        eng.append((s["g"], n))
+            if len(rows) >= 20000:
+                con.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+                con.executemany("INSERT INTO eng VALUES (?,?)", eng)
+                rows, eng = [], []
+    con.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    con.executemany("INSERT INTO eng VALUES (?,?)", eng)
+    con.executescript("""
+        CREATE INDEX i_lower ON entries(lower);
+        CREATE INDEX i_norm ON entries(norm);
+    """)
+    con.commit()
+    con.execute("VACUUM")
+    con.close()
+    os.replace(tmp, DB)
+    print("Built %s (%d entries)" % (DB, n), file=sys.stderr)
+
+
+def update():
+    os.makedirs(os.path.dirname(SRC), exist_ok=True)
+    print("Downloading %s ..." % URL, file=sys.stderr)
+    urllib.request.urlretrieve(URL, SRC + ".part")
+    os.replace(SRC + ".part", SRC)
+    build()
+
+
+# ---------------------------------------------------------------- lookup
+
+def pos_rank(pos):
+    return POS_ORDER.index(pos) if pos in POS_ORDER else len(POS_ORDER) + (pos == "name")
+
+
+def fetch(con, where, arg):
+    cur = con.execute("SELECT id, word, pos, ipa, syll, gender, is_form, senses FROM entries "
+                      "WHERE %s = ?" % where, (arg,))
+    out = []
+    for r in cur:
+        out.append({"id": r[0], "word": r[1], "pos": r[2], "ipa": r[3], "syll": r[4],
+                    "gender": r[5], "is_form": r[6], "senses": json.loads(r[7])})
+    return out
+
+
+FUNCTION_POS = {"det", "pron", "article", "prep", "conj", "contraction"}
+ALT = re.compile(r"^(alternative (form|spelling)|apocopic form) of ")
+
+
+def trivial(e):
+    # proper names, letter names, and glosses that just repeat the word ("Leo", "mi")
+    w = e["word"].lower()
+    return e["pos"] == "name" or e["word"][:1].isupper() or all(
+        s["g"].lower().strip(" .") == w or "letter" in s["g"].lower() for s in e["senses"])
+
+
+def richness(e):
+    return len(e["senses"]) + sum(1 for s in e["senses"] if "x" in s)
+
+
+def sort_entries(entries, q):
+    # exact case > real words > dictionary forms over inflections (except function
+    # words like mi/tu) > alternative spellings > entries with more senses/examples
+    def key(e):
+        alt = all(ALT.match(s["g"]) for s in e["senses"])
+        if e["pos"] in FUNCTION_POS or not e["is_form"]:
+            bucket = 0
+        else:
+            bucket = 2 if alt else 1
+        # inflections are ranked by how rich their dictionary entry is
+        return (e["word"] != q, trivial(e), bucket, -e.get("lemma_rich", richness(e)),
+                pos_rank(e["pos"]))
+    return sorted(entries, key=key)
+
+
+def add_lemma_richness(con, entries):
+    for e in entries:
+        if e["is_form"]:
+            best = 0
+            for s in e["senses"]:
+                for w in s.get("f", []):
+                    for x in fetch(con, "word", w):
+                        if not x["is_form"]:
+                            best = max(best, richness(x))
+            e["lemma_rich"] = best
+
+
+def lemmas_of(entries):
+    seen = []
+    for e in entries:
+        for s in e["senses"]:
+            for w in s.get("f", []):
+                if w not in seen:
+                    seen.append(w)
+    return seen
+
+
+SPELLING = re.compile(r"^(misspelling|obsolete spelling|obsolete form|archaic spelling|"
+                      r"nonstandard spelling|pre-\d+ spelling) of ")
+
+
+def is_old(e):
+    return all(set(s["t"]) & OLD_TAGS or SPELLING.match(s["g"]) for s in e["senses"])
+
+
+def is_misspelling(e):
+    return all(SPELLING.match(s["g"]) for s in e["senses"])
+
+
+def fuzzy(con, q):
+    n = norm(q)
+    if len(n) < 3:
+        return []
+    prefix = n[:2]
+    cands = [r[0] for r in con.execute(
+        "SELECT DISTINCT norm FROM entries WHERE norm >= ? AND norm < ? AND length(norm) BETWEEN ? AND ?",
+        (prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1), len(n) - 2, len(n) + 2))]
+    return difflib.get_close_matches(n, cands, n=3, cutoff=0.8)
+
+
+def spanish_lookup(con, q):
+    ql = q.lower()
+    note = None
+    found = fetch(con, "lower", ql)
+    variants = [e for e in fetch(con, "norm", norm(q)) if e["word"].lower() != ql]
+    # Misspelling entries ("tambien") just point elsewhere: follow them silently.
+    if found and all(is_misspelling(e) for e in found):
+        targets = lemmas_of(found)
+        note = "Showing %s for “%s”." % (", ".join(targets[:3]), q)
+        found = [x for t in targets for x in fetch(con, "word", t)]
+        variants = [e for e in variants if e["word"] not in targets]
+    if found:
+        variants = [e for e in variants if not is_old(e)]
+    if not found and variants:
+        shown = sorted({e["word"] for e in variants})
+        note = "Showing %s for “%s”." % (", ".join(shown[:3]), q)
+        found, variants = variants, []
+    add_lemma_richness(con, found + variants)
+    found = sort_entries(found, q) + sort_entries(variants, q)
+    # resolve conjugated / inflected forms to their dictionary entries
+    ids = {e["id"] for e in found}
+    extra = []
+    for lemma in lemmas_of(found):
+        for e in sort_entries(fetch(con, "word", lemma), lemma):
+            if e["id"] not in ids and not e["is_form"]:
+                e["from"] = True
+                extra.append(e)
+                ids.add(e["id"])
+                break
+    # put each lemma right after the first form entry that points to it
+    result = []
+    for e in found:
+        result.append(e)
+        for s in e["senses"]:
+            for w in s.get("f", []):
+                for x in list(extra):
+                    if x["word"] == w:
+                        result.append(x)
+                        extra.remove(x)
+    return result + extra, note
+
+
+def english_lookup(con, q):
+    terms = re.findall(r"[a-zA-Z']+", q.lower())
+    if not terms:
+        return []
+    match = " ".join('"%s"' % t for t in terms)
+    phrase = " ".join(terms)
+    cands = {}
+    for gloss, eid, rank in con.execute(
+            "SELECT gloss, entry, bm25(eng) FROM eng WHERE eng MATCH ? ORDER BY bm25(eng) LIMIT 400",
+            (match,)):
+        segs = [s.strip().lower() for s in re.split(r"[,;()]", re.sub(r"\[.*?\]", "", gloss))]
+        score = rank  # lower is better
+        if phrase in segs or ("to " + phrase) in segs or ("a " + phrase) in segs or ("the " + phrase) in segs:
+            score -= 20
+            if segs and segs[0] in (phrase, "to " + phrase, "a " + phrase):
+                score -= 10
+        score += len(gloss) / 40.0
+        if eid not in cands or score < cands[eid]:
+            cands[eid] = score
+    entries = []
+    for eid, score in sorted(cands.items(), key=lambda x: x[1])[:60]:
+        e = fetch(con, "id", eid)[0]
+        if e["pos"] == "name" or e["word"][:1].isupper():
+            score += 15
+        if " " in e["word"]:
+            score += 4
+        old = all(set(s["t"]) & OLD_TAGS for s in e["senses"] if "f" not in s)
+        if old:
+            score += 25
+        e["score"] = score
+        entries.append(e)
+    entries.sort(key=lambda e: e["score"])
+    return entries
+
+
+def describe(tags):
+    return ", ".join(t.replace("-", " ") for t in tags)
+
+
+def to_json_entry(e, english_terms=None):
+    senses_out, seen_pos = [], False
+    senses = e["senses"]
+    if english_terms:  # English search: show the matching senses first
+        senses = sorted(senses, key=lambda s: not any(t in s["g"].lower() for t in english_terms))
+    for s in senses[:MAX_SENSES]:
+        pos = None
+        if not seen_pos:
+            pos = POS_LABEL.get(e["pos"], e["pos"])
+            if e.get("gender"):
+                pos += " (%s)" % e["gender"]
+            seen_pos = True
+        ex = None
+        if s.get("x"):
+            ex = "%s — %s" % (s["x"][0], s["x"][1])
+        gloss = s["g"]
+        for w in s.get("f", []):
+            if w not in gloss:
+                gloss += " of " + w
+        senses_out.append({"pos": pos, "gloss": gloss,
+                           "extra": describe(s["t"]) or None, "example": ex})
+    note = None
+    if e.get("gender") in ("m", "f") and not e.get("is_form"):
+        article = "el" if e["gender"] == "m" else "la"
+        if e["word"][:1] in "aá" and e["gender"] == "f" and e["word"].lower().startswith(("a", "á")):
+            note = "%s %s (uses “el” in the singular if stressed on the first a)" % (article, e["word"])
+        else:
+            note = "%s %s" % (article, e["word"])
+    if e.get("from"):
+        note = ("dictionary form · " + note) if note else "dictionary form"
+    syll = e.get("syll") or ""
+    syll = syll if ("·" in syll or "‧" in syll) else None  # skip one-syllable words
+    reading = " ".join(x for x in [syll, e.get("ipa")] if x) or None
+    return {"word": e["word"], "reading": reading, "common": False, "note": note,
+            "form": [], "senses": senses_out, "more": max(0, len(e["senses"]) - MAX_SENSES)}
+
+
+def lookup(q, force_english=False):
+    q = clean_query(q)
+    if not os.path.exists(DB):
+        raise SystemExit("No database yet. Run: sdict --update")
+    con = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
+    note, entries, english = None, [], False
+    if q.lower().startswith("en "):
+        q, force_english = q[3:].strip(), True
+    if not force_english:
+        entries, note = spanish_lookup(con, q)
+        if not entries and " " in q:
+            # phrase not in the dictionary: look up each word
+            for w in q.split():
+                found, _ = spanish_lookup(con, w)
+                entries.extend(found[:2])
+            if entries:
+                note = "No entry for the whole phrase; showing each word. For sentences, right-click → Translate."
+    if not entries and re.fullmatch(r"[A-Za-z' ]+", q or "x"):
+        entries = english_lookup(con, q)
+        english = bool(entries)
+        note = "English → Spanish" if entries else None
+    if not entries and not force_english:
+        close = fuzzy(con, q)
+        for n in close:
+            found, _ = spanish_lookup(con, n)
+            entries.extend(found[:3])
+        if entries:
+            words = []
+            for e in entries:
+                if e["word"] not in words and not e.get("from"):
+                    words.append(e["word"])
+            note = "No match for “%s”. Did you mean %s?" % (q, ", ".join(words[:3]))
+    terms = re.findall(r"[a-z']+", q.lower()) if english else None
+    out = [to_json_entry(e, terms) for e in entries[:MAX_ENTRIES]]
+    return {"query": q, "note": note, "entries": out, "more": max(0, len(entries) - MAX_ENTRIES)}
+
+
+def print_text(res):
+    B, D, R = "\033[1m", "\033[2m", "\033[0m"
+    if not sys.stdout.isatty():
+        B = D = R = ""
+    if res["note"]:
+        print(D + res["note"] + R)
+    if not res["entries"]:
+        print("No match for “%s”." % res["query"])
+    for i, e in enumerate(res["entries"]):
+        if i:
+            print()
+        head = B + e["word"] + R
+        if e["reading"]:
+            head += "  " + D + e["reading"] + R
+        print(head)
+        if e["note"]:
+            print("  " + D + e["note"] + R)
+        for n, s in enumerate(e["senses"], 1):
+            if s["pos"]:
+                print("  " + D + s["pos"] + R)
+            line = "  %d. %s" % (n, s["gloss"])
+            if s["extra"]:
+                line += D + "  (" + s["extra"] + ")" + R
+            print(line)
+            if s["example"]:
+                print("     " + D + s["example"] + R)
+        if e["more"]:
+            print("  " + D + "+ %d more" % e["more"] + R)
+    if res["more"]:
+        print(D + "\n%d more matches" % res["more"] + R)
+
+
+def main(argv):
+    args = argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return
+    if args[0] == "--update":
+        update()
+        return
+    if args[0] == "--build":
+        build()
+        return
+    as_json = "--json" in args
+    english = "-e" in args
+    words = [a for a in args if a not in ("--json", "-e")]
+    res = lookup(" ".join(words), force_english=english)
+    if as_json:
+        print(json.dumps(res, ensure_ascii=False))
+    else:
+        print_text(res)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

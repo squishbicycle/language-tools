@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""jsent: read a whole Japanese sentence aloud.
+
+Usage:
+  jsent                       # sentence from the clipboard
+  jsent 私はアメリカ人です。     # sentence given as an argument
+  jsent -s 0.6 ...            # Google voice speed (0.25-2.0, default 0.75)
+  jsent -g Aoede ...          # a different Google voice (default Charon)
+  jsent --mac ...             # skip straight to the macOS voice
+  jsent --google-only ...     # Google voice or nothing (used by jsay)
+
+Sources, best first:
+  1. Tatoeba: a real native-speaker recording, if someone has recorded
+     exactly this sentence.
+  2. Google Cloud Text-to-Speech (Chirp 3 HD voices). Needs an API key in
+     ~/japanese-tools/google-tts-key. Results are cached in
+     ~/japanese-tools/cache, so replays are free and instant.
+  3. macOS text-to-speech (Otoya Enhanced), e.g. when offline.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+KEY_FILE = os.path.join(HERE, "google-tts-key")
+CACHE_DIR = os.path.join(HERE, "cache")
+
+TATOEBA_SEARCH = "https://api.tatoeba.org/v1/sentences"
+TATOEBA_AUDIO = "https://api.tatoeba.org/v1/audios/{}/file"
+GOOGLE_TTS = "https://texttospeech.googleapis.com/v1/text:synthesize"
+
+DEFAULT_SPEED = 0.75
+DEFAULT_GOOGLE_VOICE = "Charon"
+DEFAULT_RATE = 1  # say clamps this to its slowest speed; normal is ~180 wpm
+DEFAULT_VOICE = "Otoya (Enhanced)"
+PUNCTUATION = " \t\r\n　。、！？!?.,「」『』()（）…・"
+
+
+def http(url, data=None, headers=None):
+    headers = dict(headers or {}, **{"User-Agent": "jsent"})
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read()
+
+
+def normalize(s):
+    return "".join(c for c in s if c not in PUNCTUATION)
+
+
+def play(audio):
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as f:
+        f.write(audio)
+        f.flush()
+        subprocess.run(["afplay", f.name])
+
+
+def from_tatoeba(text):
+    """(audio, credit) for a recording of exactly this sentence, or None."""
+    params = {"lang": "jpn", "q": normalize(text), "has_audio": "yes",
+              "sort": "relevance", "limit": 20, "include": "audios"}
+    try:
+        data = json.loads(http(TATOEBA_SEARCH + "?" + urllib.parse.urlencode(params)))["data"]
+    except Exception:
+        return None
+    for sentence in data:
+        if normalize(sentence["text"]) != normalize(text):
+            continue
+        for audio in sentence.get("audios", []):
+            try:
+                # Refused (403) when the speaker doesn't allow reuse outside Tatoeba.
+                return http(TATOEBA_AUDIO.format(audio["id"])), audio.get("author", "unknown")
+            except urllib.error.HTTPError:
+                continue
+    return None
+
+
+def from_google(text, voice, speed):
+    """(audio, error) from Google TTS, cached on disk."""
+    if not os.path.exists(KEY_FILE):
+        return None, "no API key in " + KEY_FILE
+    name = "ja-JP-Chirp3-HD-" + voice
+    cache_key = hashlib.sha256("{}|{}|{}".format(name, speed, text).encode()).hexdigest()
+    cache_path = os.path.join(CACHE_DIR, cache_key + ".mp3")
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            return f.read(), None
+
+    with open(KEY_FILE) as f:
+        key = f.read().strip()
+    body = {"input": {"text": text},
+            "voice": {"languageCode": "ja-JP", "name": name},
+            "audioConfig": {"audioEncoding": "MP3", "speakingRate": speed}}
+    try:
+        resp = http(GOOGLE_TTS + "?key=" + urllib.parse.quote(key),
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"})
+    except urllib.error.HTTPError as e:
+        try:
+            return None, json.loads(e.read())["error"]["message"]
+        except Exception:
+            return None, "HTTP {}".format(e.code)
+    except Exception as e:
+        return None, str(e)
+
+    audio = base64.b64decode(json.loads(resp)["audioContent"])
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(cache_path, "wb") as f:
+        f.write(audio)
+    return audio, None
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="jsent", description="Read a Japanese sentence aloud.")
+    parser.add_argument("-s", "--speed", type=float, default=DEFAULT_SPEED,
+                        help="Google voice speed, 0.25-2.0 (default %(default)s)")
+    parser.add_argument("-g", "--google-voice", default=DEFAULT_GOOGLE_VOICE,
+                        help="Google Chirp 3 HD voice (default %(default)s)")
+    parser.add_argument("--mac", action="store_true", help="use the macOS voice only")
+    parser.add_argument("--google-only", action="store_true",
+                        help="use only the Google voice; fail instead of falling back")
+    parser.add_argument("-r", "--rate", type=int, default=DEFAULT_RATE,
+                        help="macOS words per minute (default: slowest)")
+    parser.add_argument("-v", "--voice", default=DEFAULT_VOICE, help="macOS voice (default %(default)s)")
+    parser.add_argument("text", nargs="*", help="sentence to read (default: clipboard)")
+    args = parser.parse_args()
+
+    if args.text:
+        text = " ".join(args.text)
+    else:
+        text = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    text = text.strip()
+    if not text:
+        sys.exit("jsent: nothing to read (clipboard is empty)")
+
+    if args.google_only:
+        audio, error = from_google(text, args.google_voice, args.speed)
+        if not audio:
+            sys.exit("jsent: Google TTS unavailable ({})".format(error))
+        print("▶ {}  (Google {}, not a native recording)".format(text, args.google_voice))
+        play(audio)
+        return
+
+    if not args.mac:
+        found = from_tatoeba(text)
+        if found:
+            print("▶ {}  (native recording by {}, Tatoeba)".format(text, found[1]))
+            play(found[0])
+            return
+
+        audio, error = from_google(text, args.google_voice, args.speed)
+        if audio:
+            print("▶ {}  (Google {})".format(text, args.google_voice))
+            play(audio)
+            return
+        print("jsent: Google TTS unavailable ({}); using {}".format(error, args.voice), file=sys.stderr)
+
+    print("▶ " + text)
+    subprocess.run(["say", "-v", args.voice, "-r", str(args.rate), text])
+
+
+if __name__ == "__main__":
+    main()

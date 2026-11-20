@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""jdict: offline Japanese–English dictionary (JMdict).
+
+Usage:
+  jdict 食べました         # look up a word (conjugated forms are fine)
+  jdict dungeon            # English → Japanese
+  jdict                    # word from the clipboard
+  jdict --json 食べる       # machine-readable output (used by JDict.app)
+  jdict --update           # download the latest JMdict and rebuild the database
+
+The dictionary data is JMdict (the same data Jisho and Yomitan use), stored in
+~/japanese-tools/jdict-data/jmdict.sqlite. JDict.app (jdict-app/) is the
+hotkey window; its Play buttons run jsay.
+"""
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import unicodedata
+import urllib.request
+import zipfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+DATA_DIR = os.path.join(HERE, "jdict-data")
+DB_PATH = os.path.join(DATA_DIR, "jmdict.sqlite")
+RELEASES_URL = "https://api.github.com/repos/scriptin/jmdict-simplified/releases/latest"
+STRIP = " \t\r\n　。、！？!?.,「」『』()（）"
+MAX_SENSES = 6
+
+# ---------------------------------------------------------------- kana helpers
+
+
+def to_hiragana(s):
+    return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ヶ" else c for c in s)
+
+
+def is_japanese(s):
+    return any("぀" <= c <= "ヿ" or "一" <= c <= "鿿" or c == "々" for c in s)
+
+
+# Big ↔ small kana, for "did you mean" when nothing matches (ダンジヨン → ダンジョン).
+SMALL = dict(zip("やゆよつあいうえおわかけヤユヨツアイウエオワカケ",
+                 "ゃゅょっぁぃぅぇぉゎゕゖャュョッァィゥェォヮヵヶ"))
+SMALL.update({v: k for k, v in list(SMALL.items())})
+
+
+def typo_variants(text):
+    out = []
+    for i, c in enumerate(text):
+        if c in SMALL:
+            out.append(text[:i] + SMALL[c] + text[i + 1:])
+    return out
+
+
+# ------------------------------------------------------------- deinflection
+# Each rule: (inflected ending, base ending, types the inflected form must have,
+# type of the base, label). An empty "must have" set means the rule only
+# applies to the text as given, not to an already deinflected form. This is
+# the same idea as Yomitan's deinflector, with a smaller rule set.
+
+V1, V5, VS, VK, ADJ = {"v1"}, {"v5"}, {"vs"}, {"vk"}, {"adj-i"}
+END = set()
+MASU = [("ます", "polite"), ("ました", "polite past"), ("ません", "polite negative"),
+        ("ませんでした", "polite past negative"), ("ましょう", "let's (polite volitional)")]
+GODAN = [  # dictionary ending, a, i, e, o, te, ta
+    ("う", "わ", "い", "え", "お", "って", "った"),
+    ("く", "か", "き", "け", "こ", "いて", "いた"),
+    ("ぐ", "が", "ぎ", "げ", "ご", "いで", "いだ"),
+    ("す", "さ", "し", "せ", "そ", "して", "した"),
+    ("つ", "た", "ち", "て", "と", "って", "った"),
+    ("ぬ", "な", "に", "ね", "の", "んで", "んだ"),
+    ("ぶ", "ば", "び", "べ", "ぼ", "んで", "んだ"),
+    ("む", "ま", "み", "め", "も", "んで", "んだ"),
+    ("る", "ら", "り", "れ", "ろ", "って", "った"),
+]
+
+
+def te_family(te, ta, base, kind):
+    return [
+        (te, base, END, kind, "te-form"),
+        (ta, base, END, kind, "past"),
+        (ta + "ら", base, END, kind, "if/when (-tara)"),
+        (ta + "り", base, END, kind, "-tari"),
+        (te + "いる", base, V1, kind, "-te iru (ongoing)"),
+        (te + "る", base, V1, kind, "-te ru (ongoing, casual)"),
+        (te + "ください", base, END, kind, "please (-te kudasai)"),
+        (te + "しまう", base, V5, kind, "-te shimau (completely / regret)"),
+    ]
+
+
+def verb_rules(stem_masu, base, kind, nai, tai, volitional, ba, extra):
+    rules = [(stem_masu + m, base, END, kind, label) for m, label in MASU]
+    rules += [
+        (stem_masu + "なさい", base, END, kind, "command (-nasai)"),
+        (nai, base, ADJ, kind, "negative"),
+        (tai, base, ADJ, kind, "want to (-tai)"),
+        (volitional, base, END, kind, "volitional (let's)"),
+        (ba, base, END, kind, "if (-ba)"),
+    ]
+    return rules + extra
+
+
+def build_rules():
+    rules = []
+    rules += verb_rules("", "る", V1, "ない", "たい", "よう", "れば", [
+        ("られる", "る", V1, V1, "potential / passive"),
+        ("させる", "る", V1, V1, "causative (make/let)"),
+        ("ろ", "る", END, V1, "imperative"),
+    ]) + te_family("て", "た", "る", V1)
+    for u, a, i, e, o, te, ta in GODAN:
+        rules += verb_rules(i, u, V5, a + "ない", i + "たい", o + "う", e + "ば", [
+            (a + "れる", u, V1, V5, "passive"),
+            (a + "せる", u, V1, V5, "causative (make/let)"),
+            (e + "る", u, V1, V5, "potential (can)"),
+        ]) + te_family(te, ta, u, V5)
+    rules += te_family("って", "った", "く", V5)  # 行く → 行って
+    rules += verb_rules("し", "する", VS, "しない", "したい", "しよう", "すれば", [
+        ("される", "する", V1, VS, "passive"),
+        ("させる", "する", V1, VS, "causative (make/let)"),
+        ("できる", "する", V1, VS, "potential (can)"),
+        ("しろ", "する", END, VS, "imperative"),
+    ]) + te_family("して", "した", "する", VS)
+    rules.append(("する", "", VS, {"vs-noun"}, "する verb"))  # 勉強する → 勉強
+    for k, ku, ko in (("き", "くる", "こ"), ("来", "来る", "来")):
+        kuru_ba = "くれば" if k == "き" else "来れば"
+        rules += verb_rules(k, ku, VK, ko + "ない", k + "たい", ko + "よう", kuru_ba, [
+            (ko + "られる", ku, V1, VK, "potential / passive"),
+            (ko + "させる", ku, V1, VK, "causative (make/let)"),
+            (ko + "い", ku, END, VK, "imperative"),
+        ]) + te_family(k + "て", k + "た", ku, VK)
+    rules += [
+        ("くない", "い", ADJ, ADJ, "negative"),
+        ("かった", "い", END, ADJ, "past"),
+        ("かったら", "い", END, ADJ, "if/when (-tara)"),
+        ("くて", "い", END, ADJ, "te-form"),
+        ("く", "い", END, ADJ, "adverb (-ku)"),
+        ("ければ", "い", END, ADJ, "if (-ba)"),
+        ("さ", "い", END, ADJ, "noun (-sa)"),
+        ("そう", "い", END, ADJ, "looks (-sou)"),
+    ]
+    return rules
+
+
+RULES = build_rules()
+TYPE_MATCHES = {
+    "v1": lambda p: p in ("v1", "v1-s"),
+    "v5": lambda p: p.startswith("v5"),
+    "vs": lambda p: p in ("vs-i", "vs-s"),
+    "vk": lambda p: p == "vk",
+    "adj-i": lambda p: p in ("adj-i", "adj-ix"),
+    "vs-noun": lambda p: p == "vs",
+}
+
+
+def deinflect(text):
+    """Return [(candidate, required type or None, [labels, base first])]."""
+    results = [(text, None, [])]
+    seen = {(text, None)}
+    i = 0
+    while i < len(results) and len(results) < 500:
+        word, kind, labels = results[i]
+        i += 1
+        for inflected, base, must, out, label in RULES:
+            if not word.endswith(inflected):
+                continue
+            if kind is not None and not (must & {kind}):
+                continue
+            new = word[: len(word) - len(inflected)] + base
+            new_kind = next(iter(out))
+            if new and (new, new_kind) not in seen:
+                seen.add((new, new_kind))
+                results.append((new, new_kind, [label] + labels))
+    return results
+
+
+# ------------------------------------------------------------------ database
+
+
+def update():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with urllib.request.urlopen(RELEASES_URL, timeout=30) as resp:
+        release = json.load(resp)
+    asset = next(a for a in release["assets"]
+                 if re.match(r"jmdict-eng-\d.*\.json\.zip$", a["name"]))
+    download_dir = os.path.join(DATA_DIR, "download")
+    shutil.rmtree(download_dir, ignore_errors=True)
+    os.makedirs(download_dir)
+    zip_path = os.path.join(download_dir, "jmdict.zip")
+    print("Downloading {} ({:.0f} MB)…".format(asset["name"], asset["size"] / 1e6))
+    urllib.request.urlretrieve(asset["browser_download_url"], zip_path)
+    build(zip_path)
+
+
+def norm_gloss(g):
+    g = re.sub(r"\([^)]*\)", "", g.lower())
+    g = re.sub(r"^to ", "", g.strip())
+    return re.sub(r"\s+", " ", g).strip()
+
+
+def build(zip_path):
+    print("Building the database…")
+    with zipfile.ZipFile(zip_path) as z:
+        data = json.loads(z.read(z.namelist()[0]))
+    tmp = DB_PATH + ".tmp"
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    db = sqlite3.connect(tmp)
+    db.executescript("""
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE entries (id INTEGER PRIMARY KEY, common INTEGER, data TEXT);
+        CREATE TABLE forms (key TEXT, id INTEGER, surface TEXT, common INTEGER);
+        CREATE TABLE glosses (key TEXT, id INTEGER, sense INTEGER);
+    """)
+    db.execute("INSERT INTO meta VALUES ('tags', ?)", (json.dumps(data["tags"]),))
+    db.execute("INSERT INTO meta VALUES ('version', ?)",
+               ("{} ({})".format(data["version"], data["dictDate"]),))
+    entries, forms, glosses = [], [], []
+    for w in data["words"]:
+        wid = int(w["id"])
+        kanji = [[k["text"], k["common"], k["tags"]] for k in w["kanji"]]
+        kana = [[k["text"], k["common"], k["tags"], k["appliesToKanji"]] for k in w["kana"]]
+        senses = [[s["partOfSpeech"], s["misc"], s["info"], [g["text"] for g in s["gloss"]]]
+                  for s in w["sense"]]
+        common = any(k[1] for k in kanji + kana)
+        entries.append((wid, common, json.dumps([kanji, kana, senses], ensure_ascii=False)))
+        for text, c, *_ in kanji + kana:
+            forms.append((to_hiragana(text), wid, text, c))
+        for i, s in enumerate(senses):
+            for g in set(norm_gloss(g) for g in s[3]):
+                glosses.append((g, wid, i))
+    db.executemany("INSERT INTO entries VALUES (?, ?, ?)", entries)
+    db.executemany("INSERT INTO forms VALUES (?, ?, ?, ?)", forms)
+    db.executemany("INSERT INTO glosses VALUES (?, ?, ?)", glosses)
+    db.executescript("CREATE INDEX forms_key ON forms (key); CREATE INDEX glosses_key ON glosses (key);")
+    db.commit()
+    db.close()
+    os.replace(tmp, DB_PATH)
+    print("Done: {} entries ({}).".format(len(entries), data["dictDate"]))
+
+
+def connect():
+    if not os.path.exists(DB_PATH):
+        sys.exit("jdict: no dictionary yet; run `jdict --update`")
+    return sqlite3.connect(DB_PATH)
+
+
+# ------------------------------------------------------------------- lookup
+
+
+def entry_pos(senses):
+    return {p for s in senses for p in s[0]}
+
+
+def find_japanese(db, text):
+    """Return [(entry id, matched form, labels)], best first."""
+    found = {}
+    for cand, kind, labels in deinflect(to_hiragana(text)):
+        rows = db.execute("SELECT f.id, f.surface, f.common, e.common, e.data FROM forms f "
+                          "JOIN entries e ON e.id = f.id WHERE f.key = ?", (cand,)).fetchall()
+        for wid, surface, form_common, entry_common, data in rows:
+            if kind is not None and not any(TYPE_MATCHES[kind](p) for p in entry_pos(json.loads(data)[2])):
+                continue
+            exact = surface == text
+            rank = (not exact and not labels, not form_common, len(labels), wid)
+            if wid not in found or rank < found[wid][0]:
+                found[wid] = (rank, surface, labels)
+    return [(wid, surface, labels) for wid, (rank, surface, labels)
+            in sorted(found.items(), key=lambda x: x[1][0])]
+
+
+UNUSUAL = {"hon", "hum", "arch", "obs", "rare", "dated", "form", "vulg", "derog", "sl"}
+
+
+def find_english(db, text):
+    rows = db.execute("SELECT g.id, MIN(g.sense), e.common, e.data FROM glosses g JOIN entries e "
+                      "ON e.id = g.id WHERE g.key = ? GROUP BY g.id", (norm_gloss(text),)).fetchall()
+
+    def rank(row):
+        # Earlier sense, common word, plain register, fewer other meanings in that sense.
+        wid, sense, common, data = row
+        _, misc, _, glosses = json.loads(data)[2][sense]
+        return (sense, not common, bool(UNUSUAL & set(misc)), len(glosses), wid)
+
+    return [(row[0], None, []) for row in sorted(rows, key=rank)]
+
+
+def lookup(db, text):
+    """Return (results, note)."""
+    if not is_japanese(text):
+        return find_english(db, text), None
+    results = find_japanese(db, text)
+    if results:
+        return results, None
+    for variant in typo_variants(text):
+        results = find_japanese(db, variant)
+        if results:
+            return results, "No match for 「{}」. Did you mean 「{}」?".format(text, variant)
+    for n in range(len(text) - 1, 0, -1):  # longest match from the start
+        results = find_japanese(db, text[:n])
+        if results:
+            return results, "Showing 「{}」, the first word of 「{}」.".format(text[:n], text)
+    return [], None
+
+
+# ------------------------------------------------------------------- display
+
+POS = {
+    "n": "noun", "v1": "ru-verb", "v1-s": "ru-verb (special)", "v5k-s": "u-verb (irregular te-form 行って)",
+    "v5r-i": "u-verb (irregular)", "v5aru": "u-verb (special)", "vs-i": "irregular verb (する)",
+    "vs-s": "する verb (special)", "vs": "+する verb", "vk": "irregular verb (来る)",
+    "adj-i": "い-adjective", "adj-ix": "い-adjective (いい/よい)", "adj-na": "な-adjective",
+    "adj-no": "takes の", "adj-pn": "pre-noun adjective", "adj-t": "taru-adjective",
+    "adj-f": "pre-noun", "adv": "adverb", "adv-to": "adverb (takes と)", "aux": "auxiliary",
+    "aux-v": "auxiliary verb", "aux-adj": "auxiliary adjective", "conj": "conjunction",
+    "cop": "copula", "ctr": "counter", "exp": "expression", "int": "interjection",
+    "n-adv": "adverbial noun", "n-pref": "prefix", "n-suf": "suffix", "n-t": "time noun",
+    "num": "number", "pn": "pronoun", "pref": "prefix", "prt": "particle", "suf": "suffix",
+    "unc": "", "vt": "transitive", "vi": "intransitive",
+}
+MISC = {
+    "uk": "usually written in kana", "col": "colloquial", "sl": "slang", "net-sl": "internet slang",
+    "hon": "honorific", "hum": "humble", "pol": "polite", "fam": "familiar", "male": "male speech",
+    "fem": "female speech", "abbr": "abbreviation", "arch": "archaic", "dated": "dated",
+    "derog": "derogatory", "vulg": "vulgar", "on-mim": "onomatopoeia", "obs": "obsolete",
+    "rare": "rare", "yoji": "four-character idiom", "id": "idiom", "joc": "jocular",
+    "proverb": "proverb", "sens": "sensitive", "form": "formal", "chn": "children's language",
+}
+HIDDEN_FORM_TAGS = {"sK", "sk", "iK", "ik", "oK", "ok", "rK", "rk"}
+
+
+def pos_label(p, tags):
+    if p in POS:
+        return POS[p]
+    if p.startswith("v5"):
+        return "u-verb"
+    return tags.get(p, p)
+
+
+def headword(kanji, kana, senses, surface):
+    """Return (word, reading or None, note or None)."""
+    shown_kanji = [k for k in kanji if not HIDDEN_FORM_TAGS & set(k[2])]
+    shown_kana = [k for k in kana if not HIDDEN_FORM_TAGS & set(k[2])] or kana
+    if any(surface == k[0] for k in kanji):
+        reading = next((r[0] for r in shown_kana if "*" in r[3] or surface in r[3]), kana[0][0])
+        return surface, reading, None
+    reading = surface if surface and any(surface == r[0] for r in kana) else shown_kana[0][0]
+    if not shown_kanji:
+        return reading, None, None
+    word = next((k[0] for k in shown_kanji if k[1]), shown_kanji[0][0])
+    if "uk" in senses[0][1]:
+        return reading, None, "kanji 「{}」 rarely used".format(word)
+    return word, reading, None
+
+
+def entry_data(db, tags, wid, surface, labels, max_senses):
+    kanji, kana, senses = json.loads(
+        db.execute("SELECT data FROM entries WHERE id = ?", (wid,)).fetchone()[0])
+    word, reading, note = headword(kanji, kana, senses, surface)
+    common = db.execute("SELECT common FROM entries WHERE id = ?", (wid,)).fetchone()[0]
+    out, last_pos = [], None
+    for pos, misc, info, glosses in senses[:max_senses]:
+        label = ", ".join(x for x in (pos_label(p, tags) for p in pos) if x)
+        extra = [MISC.get(m, tags.get(m, m)) for m in misc if m != "uk"] + info
+        out.append({"pos": label if label and label != last_pos else None,
+                    "gloss": "; ".join(glosses), "extra": ", ".join(extra) or None})
+        last_pos = label or last_pos
+    return {"word": word, "reading": reading if reading != word else None, "common": bool(common),
+            "note": note, "form": labels, "senses": out,
+            "more": max(0, len(senses) - max_senses)}
+
+
+def entry_text(e):
+    title = e["word"] + ("【{}】".format(e["reading"]) if e["reading"] else "")
+    lines = [title + ("  ★ common" if e["common"] else "")]
+    if e["note"]:
+        lines.append("(" + e["note"] + ")")
+    if e["form"]:
+        lines.append("form: " + " → ".join(e["form"]))
+    for i, sense in enumerate(e["senses"], 1):
+        if sense["pos"]:
+            lines.append("[" + sense["pos"] + "]")
+        lines.append("  {}. {}".format(i, sense["gloss"])
+                     + ("  ({})".format(sense["extra"]) if sense["extra"] else ""))
+    if e["more"]:
+        lines.append("  … {} more".format(e["more"]))
+    return "\n".join(lines)
+
+
+def main():
+    args = sys.argv[1:]
+    if "--update" in args:
+        update()
+        return
+    as_json = "--json" in args
+    words = [a for a in args if not a.startswith("--")]
+    if words:
+        text = " ".join(words)
+    else:
+        text = subprocess.run(["pbpaste"], capture_output=True, text=True,
+                              env=dict(os.environ, LANG="en_US.UTF-8")).stdout
+    # NFKC joins split dakuten (macOS passes arguments as タ + ゛) and turns
+    # half-width ｶﾀｶﾅ into normal katakana.
+    text = unicodedata.normalize("NFKC", text).strip(STRIP)[:40]
+    if not text:
+        sys.exit("jdict: nothing to look up (clipboard is empty)")
+
+    db = connect()
+    results, note = lookup(db, text)
+    tags = json.loads(db.execute("SELECT value FROM meta WHERE key = 'tags'").fetchone()[0])
+    limit = 10 if as_json else 5
+    entries = [entry_data(db, tags, wid, surface, labels, MAX_SENSES if i == 0 else 3)
+               for i, (wid, surface, labels) in enumerate(results[:limit])]
+    if as_json:
+        print(json.dumps({"query": text, "note": note, "entries": entries,
+                          "more": max(0, len(results) - limit)}, ensure_ascii=False))
+        return
+    if not results:
+        sys.exit("No match for 「{}」.".format(text)
+                 + ("\nFor a whole sentence, select it, right-click → Translate."
+                    if is_japanese(text) else ""))
+    blocks = ([note] if note else []) + [entry_text(e) for e in entries]
+    if len(results) > limit:
+        blocks.append("({} more matches)".format(len(results) - limit))
+    print("\n\n".join(blocks))
+
+
+if __name__ == "__main__":
+    main()
