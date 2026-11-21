@@ -80,6 +80,7 @@ An offline Spanish–English dictionary built on [English Wiktionary](https://en
 - **Understands conjugations:** *voy* → *ir*, *tuviera* → *tener*, *frutas* → *fruta*.
 - **Accents optional:** *tambien* → *también*. Typos get a "did you mean": *fruitas* → *frutas*.
 - **Learner details:** nouns show their article (*la ciudad*), most meanings include an example sentence, and pronunciation follows Latin American Spanish.
+- **Common words first:** a word-frequency list puts everyday meanings on top: *tiendas* → *tienda* (store), not a rare form of *tender*.
 - **Both directions:** `sdict -e city` → *ciudad*.
 - **SDict.app:** a menu-bar app (Ñ). Copy a word, press **⌃⌥S**, and a floating window shows the entry. Type `en city` in the window to search English. The ▶ button speaks the word with the Mexican Spanish voice *Paulina*.
 
@@ -87,7 +88,7 @@ An offline Spanish–English dictionary built on [English Wiktionary](https://en
 sdict hay
 sdict "yo tambien"
 sdict -e city          # English → Spanish
-sdict --update         # download the Wiktionary data (~100 MB) and build the database
+sdict --update         # download the Wiktionary data (~100 MB) + frequency list and build the database
 ```
 
 ---
@@ -151,6 +152,7 @@ The dictionary data is downloaded on your machine and is **not** included in thi
 
 - **JMdict** © the [Electronic Dictionary Research and Development Group](https://www.edrdg.org/), used under [CC BY-SA 4.0](https://www.edrdg.org/edrdg/licence.html), via [jmdict-simplified](https://github.com/scriptin/jmdict-simplified).
 - **Wiktionary** content is available under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/); extracted by [Wiktextract / kaikki.org](https://kaikki.org/).
+- **Spanish word frequencies** come from [FrequencyWords](https://github.com/hermitdave/FrequencyWords) by Hermit Dave (OpenSubtitles 2018), licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/).
 - **Tatoeba** sentences and recordings are licensed under [CC BY 2.0 FR](https://tatoeba.org/en/terms_of_use) and their recorders' individual licenses.
 - Word readings come from the [Jisho](https://jisho.org/) API. Word audio is streamed from JapanesePod101's public dictionary endpoint and is not redistributed.
 
