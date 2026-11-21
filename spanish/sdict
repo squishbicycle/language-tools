@@ -199,7 +199,13 @@ def sort_entries(entries, q):
             bucket = 2 if alt else 1
         # inflections are ranked by how common their dictionary word is (tiendas → tienda,
         # not the rare verb tender), then by how rich that entry is
-        return (e["word"] != q, trivial(e), bucket, e.get("lemma_rank", 0),
+        if e["pos"] == "article":
+            fn = 0
+        elif e["pos"] in ("pron", "det") and len(e["word"]) <= 4:
+            fn = 1
+        else:
+            fn = 2
+        return (e["word"] != q, trivial(e), bucket, e.get("lemma_rank", 0) if bucket else 0, fn,
                 -e.get("lemma_rich", richness(e)), pos_rank(e["pos"]))
     return sorted(entries, key=key)
 
@@ -323,6 +329,8 @@ def english_lookup(con, q):
     entries = []
     for eid, score in sorted(cands.items(), key=lambda x: x[1])[:60]:
         e = fetch(con, "id", eid)[0]
+        if e["word"].lower() == phrase:  # the English loanword itself ("hot") isn't a translation
+            continue
         if e["pos"] == "name" or e["word"][:1].isupper():
             score += 15
         if " " in e["word"]:
@@ -330,6 +338,13 @@ def english_lookup(con, q):
         old = all(set(s["t"]) & OLD_TAGS for s in e["senses"] if "f" not in s)
         if old:
             score += 25
+        # the matching sense: later senses and slang count for less
+        for idx, sn in enumerate(e["senses"]):
+            if "f" not in sn and re.search(r"\b%s\b" % re.escape(phrase), sn["g"].lower()):
+                score += min(idx, 8) * 2
+                if set(sn["t"]) & {"colloquial", "slang", "vulgar", "figuratively", "derogatory"}:
+                    score += 6
+                break
         # prefer everyday Spanish words: up to +12 for rare or unranked words
         score += min(word_rank(con, e["word"]), 60000) / 5000.0
         e["score"] = score
@@ -345,8 +360,9 @@ def describe(tags):
 def to_json_entry(e, english_terms=None):
     senses_out, seen_pos = [], False
     senses = e["senses"]
-    if english_terms:  # English search: show the matching senses first
-        senses = sorted(senses, key=lambda s: not any(t in s["g"].lower() for t in english_terms))
+    if english_terms:  # English search: show the matching senses first ("stores" matches "store")
+        stems = [t[:-1] if len(t) > 3 and t.endswith("s") else t for t in english_terms]
+        senses = sorted(senses, key=lambda s: not any(t in s["g"].lower() for t in stems))
     for s in senses[:MAX_SENSES]:
         pos = None
         if not seen_pos:
@@ -379,41 +395,122 @@ def to_json_entry(e, english_terms=None):
             "form": [], "senses": senses_out, "more": max(0, len(e["senses"]) - MAX_SENSES)}
 
 
+PERSON = [("first-person singular", "yo"), ("second-person singular", "tú"),
+          ("third-person singular", "él/ella/usted"), ("first-person plural", "nosotros"),
+          ("second-person plural", "vosotros"), ("third-person plural", "ellos/ustedes"),
+          ("first/third-person singular", "yo / él/ella")]
+
+
+def short_gloss(g, limit=48):
+    g = re.sub(r"\s*\([^)]*\)", "", g).strip()
+    parts = [p.strip() for p in g.split(";") if p.strip()]
+    out = parts[0] if parts else g
+    if len(out) > 25:
+        short = [p for p in parts[1:] if len(p) <= 14]
+        if short:
+            return short[-1]
+    if len(parts) > 1 and len(out) + len(parts[1]) < limit:
+        out += "; " + parts[1]
+    return out if len(out) <= limit else out[:limit - 1].rstrip() + "…"
+
+
+def describe_form(gloss, lemma):
+    # "third-person singular present indicative of haber (“there is”)" -> "present, él/ella/usted"
+    g = re.sub(r"\s*\(.*?\)", "", gloss)
+    g = re.sub(r"\s+of\s+\S+.*$", "", g).strip()
+    who = None
+    for k, v in sorted(PERSON, key=lambda x: -len(x[0])):
+        if k in g:
+            who = v
+            g = g.replace(k, "").strip()
+            break
+    g = g.replace("indicative", "").replace("  ", " ").strip(" ,")
+    return ", ".join(x for x in [g, who] if x)
+
+
+def breakdown(con, words):
+    pieces = []
+    for w in words:
+        found, _ = spanish_lookup(con, w)
+        if not found:
+            close = fuzzy(con, w)
+            if close:
+                found, _ = spanish_lookup(con, close[0])
+        if not found:
+            pieces.append({"word": w, "lemma": None, "gloss": "?", "form": None})
+            continue
+        top = found[0]
+        lemma, form, meaning = top["word"], None, None
+        form_sense = next((s for s in top["senses"] if s.get("f")), None)
+        if top["is_form"] and form_sense:
+            lemma = form_sense["f"][0]
+            form = describe_form(form_sense["g"], lemma)
+            extra = re.search(r"\(“(.+?)”\)", form_sense["g"])   # e.g. hay: “there is, there are”
+            if extra:
+                meaning = extra.group(1)
+            lem = next((e for e in found if e["word"] == lemma and not e["is_form"]), None)
+            if lem is None:
+                lem = next((e for e in fetch(con, "word", lemma) if not e["is_form"]), None)
+        else:
+            lem = top
+        if meaning is None and lem:
+            good = [s for s in lem["senses"] if "f" not in s and not set(s["t"]) & OLD_TAGS] or lem["senses"]
+            meaning = short_gloss(good[0]["g"])
+            if len(good) > 1:
+                second = short_gloss(good[1]["g"], 30)
+                if second not in meaning and len(second) <= 20 and len(meaning) + len(second) <= 46:
+                    meaning += "; " + second
+        pieces.append({"word": w, "lemma": lemma if lemma.lower() != w.lower() else None,
+                       "gloss": meaning or "?", "form": form})
+    return pieces
+
+
 def lookup(q, force_english=False):
     q = clean_query(q)
     if not os.path.exists(DB):
         raise SystemExit("No database yet. Run: sdict --update")
     con = sqlite3.connect("file:%s?mode=ro" % DB, uri=True)
-    note, entries, english = None, [], False
+    note, entries, eng_ids, pieces = None, [], set(), None
     if q.lower().startswith("en "):
         q, force_english = q[3:].strip(), True
+    words = q.split()
+    sentence = len(words) > 1
+    ascii_q = bool(re.fullmatch(r"[A-Za-z' ]+", q or "x"))
     if not force_english:
         entries, note = spanish_lookup(con, q)
-        if not entries and " " in q:
-            # phrase not in the dictionary: look up each word
-            for w in q.split():
-                found, _ = spanish_lookup(con, w)
-                entries.extend(found[:2])
-            if entries:
-                note = "No entry for the whole phrase; showing each word. For sentences, right-click → Translate."
-    if not entries and re.fullmatch(r"[A-Za-z' ]+", q or "x"):
-        entries = english_lookup(con, q)
-        english = bool(entries)
-        note = "English → Spanish" if entries else None
-    if not entries and not force_english:
+        if sentence:
+            # SDict.app translates the whole sentence; here: a word-by-word breakdown
+            pieces = breakdown(con, words[:15])
+            if not entries:
+                note = None
+    if force_english or (not sentence and ascii_q):
+        # English -> Spanish: always with "en", and first when the word is barely Spanish ("hot")
+        weak = not entries or (word_rank(con, q) > 5000 and not force_english)
+        if (force_english and len(words) <= 3) or (weak and not sentence):
+            eng = english_lookup(con, q)
+            if eng:
+                eng_ids = {e["id"] for e in eng}
+                if entries and not force_english:
+                    note = "English → Spanish first; “%s” is also used in Spanish (see below)." % q
+                    entries = eng[:5] + [e for e in entries if e["id"] not in eng_ids]
+                else:
+                    note = "English → Spanish"
+                    entries = eng
+    if not entries and not force_english and not sentence:
         close = fuzzy(con, q)
         for n in close:
             found, _ = spanish_lookup(con, n)
             entries.extend(found[:3])
         if entries:
-            words = []
+            seen = []
             for e in entries:
-                if e["word"] not in words and not e.get("from"):
-                    words.append(e["word"])
-            note = "No match for “%s”. Did you mean %s?" % (q, ", ".join(words[:3]))
-    terms = re.findall(r"[a-z']+", q.lower()) if english else None
-    out = [to_json_entry(e, terms) for e in entries[:MAX_ENTRIES]]
-    return {"query": q, "note": note, "entries": out, "more": max(0, len(entries) - MAX_ENTRIES)}
+                if e["word"] not in seen and not e.get("from"):
+                    seen.append(e["word"])
+            note = "No match for “%s”. Did you mean %s?" % (q, ", ".join(seen[:3]))
+    terms = re.findall(r"[a-z']+", q.lower())
+    out = [to_json_entry(e, terms if e["id"] in eng_ids else None) for e in entries[:MAX_ENTRIES]]
+    return {"query": q, "note": note, "entries": out, "more": max(0, len(entries) - MAX_ENTRIES),
+            "sentence": sentence, "source": "en" if force_english else "es", "breakdown": pieces}
 
 
 def print_text(res):
@@ -422,7 +519,15 @@ def print_text(res):
         B = D = R = ""
     if res["note"]:
         print(D + res["note"] + R)
-    if not res["entries"]:
+    if res.get("breakdown"):
+        print(B + "Word by word" + R + D + "  (full-sentence translation: SDict window, ⌃⌥⇧S)" + R)
+        for p in res["breakdown"]:
+            head = p["word"] + (" → " + p["lemma"] if p["lemma"] else "")
+            tail = ("  (" + p["form"] + ")") if p["form"] else ""
+            print("  %s: %s%s" % (head, p["gloss"], D + tail + R))
+        if res["entries"]:
+            print()
+    elif not res["entries"]:
         print("No match for “%s”." % res["query"])
     for i, e in enumerate(res["entries"]):
         if i:

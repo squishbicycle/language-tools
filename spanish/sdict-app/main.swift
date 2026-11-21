@@ -1,15 +1,15 @@
 // SDict: menu-bar app for sdict. A global hotkey (⌃⌥S by default) looks up
-// the clipboard in a floating window; Play buttons speak with a Mexican Spanish voice.
+// the clipboard in a floating window; Play buttons run ssay (Google voice, cached).
 // All dictionary logic lives in ~/spanish-tools/sdict, called with --json.
 import AppKit
 import Carbon.HIToolbox
 import ServiceManagement
 import SwiftUI
+import Translation
 
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 let sdictPath = home + "/spanish-tools/sdict"
-let sayPath = "/usr/bin/say"
-let voice = "Paulina"
+let ssayPath = home + "/spanish-tools/ssay"   // Google Chirp 3 HD (cached), falls back to macOS Paulina
 let toolPath = "/usr/bin:/bin:/usr/sbin:/sbin:" + home + "/.local/bin"
 let hotKeyChoices: [(letter: String, code: Int)] = [("S", kVK_ANSI_S), ("E", kVK_ANSI_E), ("P", kVK_ANSI_P)]
 
@@ -30,11 +30,43 @@ struct Entry: Decodable {
     let more: Int
 }
 
+struct Piece: Decodable {
+    let word: String
+    let lemma: String?
+    let gloss: String
+    let form: String?
+}
+
 struct Lookup: Decodable {
     let query: String
     let note: String?
     let entries: [Entry]
     let more: Int
+    let sentence: Bool?
+    let source: String?
+    let breakdown: [Piece]?
+}
+
+// Whole-sentence translation with Apple's on-device Translation framework (no network).
+enum Translator {
+    static func translate(_ text: String, from source: String) async -> (String?, String?) {
+        let from = Locale.Language(identifier: source)
+        let to = Locale.Language(identifier: source == "en" ? "es" : "en")
+        let status = await LanguageAvailability().status(from: from, to: to)
+        guard status == .installed else {
+            return (nil, "Translation needs the Spanish language pack: System Settings → General → "
+                + "Language & Region → Translation Languages → download Spanish.")
+        }
+        if #available(macOS 26.0, *) {
+            do {
+                let session = TranslationSession(installedSource: from, target: to)
+                return (try await session.translate(text).targetText, nil)
+            } catch {
+                return (nil, "Translation failed: \(error.localizedDescription)")
+            }
+        }
+        return (nil, "Sentence translation needs macOS 26 or later.")
+    }
 }
 
 func makeProcess(_ path: String, _ args: [String]) -> Process {
@@ -57,6 +89,9 @@ final class Model: ObservableObject {
     @Published var searching = false
     @Published var playing: String?
     @Published var focusRequest = 0
+    @Published var translation: String?
+    @Published var translationError: String?
+    @Published var translating = false
     private var generation = 0
     private var pending: DispatchWorkItem?
 
@@ -73,6 +108,8 @@ final class Model: ObservableObject {
         guard !text.isEmpty else {
             lookup = nil
             error = nil
+            translation = nil
+            translationError = nil
             return
         }
         generation += 1
@@ -103,13 +140,34 @@ final class Model: ObservableObject {
                 self.searching = false
                 self.lookup = result
                 self.error = message
+                self.translation = nil
+                self.translationError = nil
+                if let result, result.sentence == true {
+                    self.translate(result.query, source: result.source ?? "es", generation: current)
+                }
             }
         }
     }
 
+    func translate(_ text: String, source: String, generation current: Int) {
+        translating = true
+        Task { @MainActor in
+            let (text, problem) = await Translator.translate(text, from: source)
+            guard current == self.generation else { return }
+            self.translating = false
+            self.translation = text
+            self.translationError = problem
+        }
+    }
+
+    func lookUpWord(_ word: String) {
+        query = word
+        search()
+    }
+
     func play(_ word: String) {
         guard playing == nil else { return }
-        let process = makeProcess(sayPath, ["-v", voice, "-r", "150", word])
+        let process = makeProcess("/usr/bin/python3", ["-I", ssayPath, word])
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         process.terminationHandler = { _ in
@@ -149,7 +207,7 @@ struct EntryView: View {
                     Image(systemName: model.playing == entry.word ? "speaker.wave.2.fill" : "play.fill")
                         .frame(width: 18)
                 }
-                .help("Speak (Paulina, Mexican Spanish)")
+                .help("Hear it (Google voice, Latin American Spanish)")
                 .disabled(model.playing != nil && model.playing != entry.word)
                 Button {
                     NSPasteboard.general.clearContents()
@@ -191,6 +249,72 @@ struct EntryView: View {
     }
 }
 
+// Translation box + word-by-word breakdown for sentences.
+struct SentenceView: View {
+    let lookup: Lookup
+    @ObservedObject var model: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text(lookup.source == "en" ? "Spanish" : "Translation")
+                        .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Spacer()
+                    if lookup.source != "en" {
+                        Button { model.play(lookup.query) } label: {
+                            Image(systemName: model.playing == lookup.query ? "speaker.wave.2.fill" : "play.fill")
+                        }
+                        .help("Hear the Spanish sentence (Google voice)")
+                        .disabled(model.playing != nil && model.playing != lookup.query)
+                    }
+                    if let t = model.translation {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(t, forType: .string)
+                        } label: { Image(systemName: "doc.on.doc") }
+                        .help("Copy translation")
+                    }
+                }
+                if model.translating {
+                    ProgressView().controlSize(.small)
+                } else if let t = model.translation {
+                    Text(t).font(.system(size: 19, weight: .medium)).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if let problem = model.translationError {
+                    Text(problem).font(.callout).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
+
+            if let pieces = lookup.breakdown, !pieces.isEmpty {
+                Text("Word by word").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                ForEach(Array(pieces.enumerated()), id: \.offset) { _, piece in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Button { model.lookUpWord(piece.word) } label: {
+                            Text(piece.word).font(.system(size: 15, weight: .semibold))
+                        }
+                        .buttonStyle(.link)
+                        .help("Show the full entry")
+                        if let lemma = piece.lemma {
+                            Text("→ \(lemma)").font(.system(size: 13)).foregroundStyle(.secondary)
+                        }
+                        Text(piece.gloss).font(.system(size: 14))
+                            .fixedSize(horizontal: false, vertical: true)
+                        if let form = piece.form {
+                            Text(form).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+        .textSelection(.enabled)
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var model: Model
     @FocusState private var fieldFocused: Bool
@@ -199,7 +323,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                TextField("Spanish (or en + English word)", text: $model.query)
+                TextField("Spanish word or sentence (en + English)", text: $model.query)
                     .textFieldStyle(.plain)
                     .font(.system(size: 20))
                     .focused($fieldFocused)
@@ -222,10 +346,11 @@ struct ContentView: View {
                         if let note = lookup.note {
                             Text(note).foregroundStyle(.orange)
                         }
-                        if lookup.entries.isEmpty {
+                        if lookup.sentence == true {
+                            SentenceView(lookup: lookup, model: model)
+                            if !lookup.entries.isEmpty { Divider() }
+                        } else if lookup.entries.isEmpty {
                             Text("No match for “\(lookup.query)”.")
-                            Text("For a whole sentence, select it, then right-click → Translate.")
-                                .foregroundStyle(.secondary)
                         }
                         ForEach(Array(lookup.entries.enumerated()), id: \.offset) { i, entry in
                             if i > 0 { Divider() }
@@ -236,14 +361,15 @@ struct ContentView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                     } else if !model.searching && model.error == nil {
-                        Text("Type a Spanish word. English: type en first (en city).").foregroundStyle(.secondary)
+                        Text("Type a Spanish word or sentence. English: type en first (en city, en where is the market).")
+                            .foregroundStyle(.secondary)
                     }
                 }
                 .padding(16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             Divider()
-            Text("Type to search    Esc: close")
+            Text("Type to search    ⌃⌥S: look up clipboard    ⌃⌥⇧S: new search    Esc: close")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 14)
@@ -267,6 +393,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var panel: Panel!
     var statusItem: NSStatusItem!
     var hotKeyRef: EventHotKeyRef?
+    var searchHotKeyRef: EventHotKeyRef?
 
     var hotKeyLetter: String {
         get { UserDefaults.standard.string(forKey: "hotKey") ?? "S" }
@@ -292,8 +419,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusItem.button?.title = "Ñ"
 
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-            DispatchQueue.main.async { AppDelegate.shared.lookUpClipboard() }
+        InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in
+            // id 1 = look up clipboard (⌃⌥S), id 2 = open an empty search window (⌃⌥⇧S)
+            var hotKey = EventHotKeyID()
+            GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                              nil, MemoryLayout<EventHotKeyID>.size, nil, &hotKey)
+            let which = hotKey.id
+            DispatchQueue.main.async {
+                if which == 2 { AppDelegate.shared.menuOpen() } else { AppDelegate.shared.lookUpClipboard() }
+            }
             return noErr
         }, 1, &spec, nil, nil)
         registerHotKey()
@@ -306,16 +440,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func registerHotKey() {
-        if let ref = hotKeyRef {
-            UnregisterEventHotKey(ref)
-            hotKeyRef = nil
-        }
+        for ref in [hotKeyRef, searchHotKeyRef].compactMap({ $0 }) { UnregisterEventHotKey(ref) }
+        hotKeyRef = nil
+        searchHotKeyRef = nil
         let code = hotKeyChoices.first { $0.letter == hotKeyLetter }?.code ?? kVK_ANSI_S
         let id = EventHotKeyID(signature: OSType(0x5344_4354), id: 1)  // "SDCT"
         let status = RegisterEventHotKey(UInt32(code), UInt32(controlKey | optionKey), id,
                                          GetApplicationEventTarget(), 0, &hotKeyRef)
-        if status != noErr {
-            showAlert("⌃⌥\(hotKeyLetter) is already used by something else.",
+        // Same letter + Shift opens an empty search window.
+        let searchID = EventHotKeyID(signature: OSType(0x5344_4354), id: 2)
+        let searchStatus = RegisterEventHotKey(UInt32(code), UInt32(controlKey | optionKey | shiftKey), searchID,
+                                               GetApplicationEventTarget(), 0, &searchHotKeyRef)
+        if status != noErr || searchStatus != noErr {
+            let taken = status != noErr ? "⌃⌥\(hotKeyLetter)" : "⌃⌥⇧\(hotKeyLetter)"
+            showAlert("\(taken) is already used by something else.",
                       "Pick another hotkey from the Ñ menu in the menu bar.")
         }
         rebuildMenu()
@@ -326,12 +464,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let lookUp = NSMenuItem(title: "Look Up Clipboard", action: #selector(menuLookUp), keyEquivalent: hotKeyLetter.lowercased())
         lookUp.keyEquivalentModifierMask = [.control, .option]
         menu.addItem(lookUp)
-        menu.addItem(NSMenuItem(title: "Open Search Window", action: #selector(menuOpen), keyEquivalent: ""))
+        let open = NSMenuItem(title: "Open Search Window", action: #selector(menuOpen), keyEquivalent: hotKeyLetter.lowercased())
+        open.keyEquivalentModifierMask = [.control, .option, .shift]
+        menu.addItem(open)
         menu.addItem(.separator())
         let hotKeyItem = NSMenuItem(title: "Hotkey", action: nil, keyEquivalent: "")
         let hotKeyMenu = NSMenu()
         for choice in hotKeyChoices {
-            let item = NSMenuItem(title: "⌃⌥" + choice.letter, action: #selector(menuHotKey(_:)), keyEquivalent: "")
+            let item = NSMenuItem(title: "⌃⌥" + choice.letter + "  (search: ⌃⌥⇧" + choice.letter + ")", action: #selector(menuHotKey(_:)), keyEquivalent: "")
             item.representedObject = choice.letter
             item.state = choice.letter == hotKeyLetter ? .on : .off
             item.target = self
@@ -352,7 +492,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func lookUpClipboard() {
         let text = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        model.query = String(text.prefix(40))
+        model.query = String(text.prefix(400))
         model.search()
         showPanel()
     }

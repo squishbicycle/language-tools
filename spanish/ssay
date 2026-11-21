@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""ssay: say a Spanish word or sentence aloud.
+
+Usage:
+  ssay                     # text from the clipboard
+  ssay ¿Hay tiendas?       # text given as an argument
+  ssay -s 0.7 ...          # Google voice speed (0.25-2.0, default 0.85)
+  ssay -g Kore ...         # a different Google voice (default Charon)
+  ssay --mac ...           # skip straight to the macOS voice
+
+Sources, best first:
+  1. Google Cloud Text-to-Speech, Chirp 3 HD voices in Latin American Spanish
+     (es-US). Uses the same API key file as jsent: ~/spanish-tools/google-tts-key
+     if it exists, otherwise ~/japanese-tools/google-tts-key. Clips are cached in
+     ~/spanish-tools/cache, so replays are free and instant.
+  2. macOS text-to-speech (Paulina, Mexican Spanish), e.g. when offline.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+KEY_FILES = [os.path.join(HERE, "google-tts-key"),
+             os.path.expanduser("~/japanese-tools/google-tts-key")]
+CACHE_DIR = os.path.join(HERE, "cache")
+GOOGLE_TTS = "https://texttospeech.googleapis.com/v1/text:synthesize"
+LANGUAGE = "es-US"
+DEFAULT_SPEED = 0.85
+DEFAULT_GOOGLE_VOICE = "Charon"
+DEFAULT_MAC_VOICE = "Paulina"
+DEFAULT_RATE = 150
+
+
+def http(url, data=None, headers=None):
+    headers = dict(headers or {}, **{"User-Agent": "ssay"})
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return resp.read()
+
+
+def play(audio):
+    with tempfile.NamedTemporaryFile(suffix=".mp3") as f:
+        f.write(audio)
+        f.flush()
+        subprocess.run(["afplay", f.name])
+
+
+def from_google(text, voice, speed):
+    """(audio, error) from Google TTS, cached on disk."""
+    key_file = next((k for k in KEY_FILES if os.path.exists(k)), None)
+    if not key_file:
+        return None, "no Google API key (google-tts-key)"
+    name = "{}-Chirp3-HD-{}".format(LANGUAGE, voice)
+    cache_key = hashlib.sha256("{}|{}|{}".format(name, speed, text).encode()).hexdigest()
+    cache_path = os.path.join(CACHE_DIR, cache_key + ".mp3")
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            return f.read(), None
+    with open(key_file) as f:
+        key = f.read().strip()
+    body = {"input": {"text": text},
+            "voice": {"languageCode": LANGUAGE, "name": name},
+            "audioConfig": {"audioEncoding": "MP3", "speakingRate": speed}}
+    try:
+        resp = http(GOOGLE_TTS + "?key=" + urllib.parse.quote(key),
+                    data=json.dumps(body).encode(),
+                    headers={"Content-Type": "application/json"})
+    except urllib.error.HTTPError as e:
+        try:
+            return None, json.loads(e.read())["error"]["message"]
+        except Exception:
+            return None, "HTTP {}".format(e.code)
+    except Exception as e:
+        return None, str(e)
+    audio = base64.b64decode(json.loads(resp)["audioContent"])
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(cache_path, "wb") as f:
+        f.write(audio)
+    return audio, None
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="ssay", description="Say Spanish text aloud.")
+    parser.add_argument("-s", "--speed", type=float, default=DEFAULT_SPEED,
+                        help="Google voice speed, 0.25-2.0 (default %(default)s)")
+    parser.add_argument("-g", "--google-voice", default=DEFAULT_GOOGLE_VOICE,
+                        help="Google Chirp 3 HD voice (default %(default)s)")
+    parser.add_argument("--mac", action="store_true", help="use the macOS voice only")
+    parser.add_argument("-r", "--rate", type=int, default=DEFAULT_RATE, help="macOS words per minute")
+    parser.add_argument("-v", "--voice", default=DEFAULT_MAC_VOICE, help="macOS voice (default %(default)s)")
+    parser.add_argument("text", nargs="*", help="text to say (default: clipboard)")
+    args = parser.parse_args()
+
+    text = " ".join(args.text) if args.text else \
+        subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
+    text = text.strip()
+    if not text:
+        sys.exit("ssay: nothing to say")
+
+    if not args.mac:
+        audio, error = from_google(text, args.google_voice, args.speed)
+        if audio:
+            play(audio)
+            return
+        print("ssay: Google voice unavailable ({}); using macOS {}.".format(error, args.voice), file=sys.stderr)
+    subprocess.run(["say", "-v", args.voice, "-r", str(args.rate), text])
+
+
+if __name__ == "__main__":
+    main()
