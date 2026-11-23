@@ -12,6 +12,8 @@ Small, offline-first command-line tools and menu-bar apps for learning **Japanes
 
 All five are plain Python 3 scripts that use only the standard library. The two pop-up apps are small SwiftUI programs.
 
+See the [changelog](CHANGELOG.md) for what's new.
+
 ### Quick start
 
 ```sh

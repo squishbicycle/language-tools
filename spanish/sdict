@@ -254,6 +254,15 @@ def is_misspelling(e):
     return all(SPELLING.match(s["g"]) for s in e["senses"])
 
 
+# Wiktionary's "sum of parts" stubs ("Used other than figuratively or idiomatically:
+# see por, que") carry no meaning of their own.
+FILLER = re.compile(r"^used other than (figuratively|idiomatically)", re.I)
+
+
+def is_filler(e):
+    return all(FILLER.match(s["g"]) for s in e["senses"])
+
+
 def fuzzy(con, q):
     n = norm(q)
     if len(n) < 3:
@@ -267,12 +276,16 @@ def fuzzy(con, q):
 
 def spanish_lookup(con, q):
     ql = q.lower()
-    note = None
+    note, targets = None, []
     found = fetch(con, "lower", ql)
     variants = [e for e in fetch(con, "norm", norm(q)) if e["word"].lower() != ql]
+    if any(not is_filler(e) for e in found):
+        found = [e for e in found if not is_filler(e)]
     # Misspelling entries ("tambien") just point elsewhere: follow them silently.
     if found and all(is_misspelling(e) for e in found):
         targets = lemmas_of(found)
+        # the likeliest intent is the same words with an accent missing: por que → por qué
+        targets.sort(key=lambda t: norm(t) != norm(q))
         note = "Showing %s for “%s”." % (", ".join(targets[:3]), q)
         found = [x for t in targets for x in fetch(con, "word", t)]
         variants = [e for e in variants if e["word"] not in targets]
@@ -284,6 +297,8 @@ def spanish_lookup(con, q):
         found, variants = variants, []
     add_lemma_richness(con, found + variants)
     found = sort_entries(found, q) + sort_entries(variants, q)
+    if targets:
+        found.sort(key=lambda e: targets.index(e["word"]) if e["word"] in targets else len(targets))
     # resolve conjugated / inflected forms to their dictionary entries
     ids = {e["id"] for e in found}
     extra = []
@@ -448,6 +463,9 @@ def breakdown(con, words):
             extra = re.search(r"\(“(.+?)”\)", form_sense["g"])   # e.g. hay: “there is, there are”
             if extra:
                 meaning = extra.group(1)
+            tail = re.search(r"\bof \S+;\s*(.+)$", form_sense["g"])   # e.g. muy: "apocopic form of mucho; very"
+            if not meaning and tail:
+                meaning = short_gloss(tail.group(1))
             lem = next((e for e in found if e["word"] == lemma and not e["is_form"]), None)
             if lem is None:
                 lem = next((e for e in fetch(con, "word", lemma) if not e["is_form"]), None)
@@ -478,7 +496,9 @@ def lookup(q, force_english=False):
     ascii_q = bool(re.fullmatch(r"[A-Za-z' ]+", q or "x"))
     if not force_english:
         entries, note = spanish_lookup(con, q)
-        if sentence:
+        # a set phrase ("por qué", "de nada") gets its own entry, not a word-by-word split
+        phrase = sentence and entries and norm(entries[0]["word"]) in (norm(q), norm(q).replace(" ", ""))
+        if sentence and not phrase:
             # SDict.app translates the whole sentence; here: a word-by-word breakdown
             pieces = breakdown(con, words[:15])
             if not entries:
