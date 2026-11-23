@@ -186,4 +186,4 @@ The dictionary data is downloaded on your machine and is **not** included in thi
 
 ## License
 
-The code in this repository is released under the [MIT License](LICENSE).
+[GPL v3](LICENSE) or later. (Versions downloaded before 2026-11-22 were MIT-licensed.)

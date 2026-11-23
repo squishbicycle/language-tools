@@ -4,6 +4,8 @@ What changed in each update, newest first.
 
 ## 2026-11-22
 
+- **License changed from MIT to GPL v3 or later.**
+
 ### sdict
 - **Accentless "por que" now gives "why."** Typing *por que* (or *¿por que?*) shows *por qué* ("why") first, then *porque* ("because") and *porqué* ("the reason"). Before, it showed a pile of "misspelling of…" stubs with "because" on top. When a typo could be one of several words, the one that differs only by a missing accent comes first.
 - **Set phrases are looked up whole.** *por qué*, *de nada*, *muy bien* and other dictionary phrases now show their own entry instead of being split into a word-by-word breakdown.
